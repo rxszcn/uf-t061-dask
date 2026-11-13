@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from collections import OrderedDict
 from contextlib import nullcontext
 from functools import partial
@@ -303,6 +304,75 @@ def test_groupby_cov(api, df, pdf, numeric_only):
 
     expect = getattr(pdf.groupby("x"), api)(numeric_only=numeric_only)
     assert_eq(agg, expect)
+
+
+@pytest.mark.parametrize("api", ["cov", "corr"])
+@pytest.mark.parametrize("npartitions", [2, 5])
+def test_groupby_cov_corr_with_nulls(api, npartitions):
+    # GH: groupby cov/corr must follow pandas' pairwise-complete semantics.
+    # As soon as any column in a group contains nulls, the old implementation
+    # combined a pairwise cross-product with marginal (per-column) counts and
+    # sums, silently producing matrices that disagreed with pandas element by
+    # element. Every statistic for a column pair must therefore use only the
+    # rows where *both* columns are observed.
+    rng = np.random.default_rng(42)
+    n_groups, n_cols, rows_per_group = 3, 4, 18
+    cols = [f"c{k}" for k in range(n_cols)]
+
+    frames = []
+    for gi in range(n_groups):
+        frames.append(
+            pd.DataFrame(
+                {
+                    "g": [f"g{gi}"] * rows_per_group,
+                    **{
+                        c: rng.normal(size=rows_per_group)
+                        + (k if k % 2 else -k)
+                        for k, c in enumerate(cols)
+                    },
+                }
+            )
+        )
+    pdf = pd.concat(frames, ignore_index=True)
+
+    # Independent, asymmetric null patterns per column (and thus per group).
+    for c in cols:
+        pdf.loc[rng.random(len(pdf)) < 0.2, c] = np.nan
+
+    ddf = from_pandas(pdf, npartitions=npartitions)
+    expected = getattr(pdf.groupby("g"), api)()
+    result = getattr(ddf.groupby("g"), api)()
+
+    # Full matrix-level, element-wise agreement (including the location of
+    # every NaN) between dask and the pandas reference implementation.
+    assert_eq(result, expected, atol=1e-12)
+    computed = result.compute()
+    assert np.array_equal(
+        np.isnan(computed.values), np.isnan(expected.values)
+    )
+
+
+@pytest.mark.parametrize("api", ["cov", "corr"])
+def test_groupby_cov_corr_nulls_single_pairwise_observation(api):
+    # A group where a column pair has fewer than two pairwise-complete rows
+    # must yield NaN for that pair (matching pandas) without raising a
+    # RuntimeWarning about divide-by-zero/invalid values.
+    pdf = pd.DataFrame(
+        {
+            "g": ["a", "a", "a", "b", "b"],
+            "x": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "y": [np.nan, np.nan, 9.0, 1.0, 2.0],
+        }
+    )
+    ddf = from_pandas(pdf, npartitions=2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        result = getattr(ddf.groupby("g"), api)()
+        computed = result.compute()
+    expected = getattr(pdf.groupby("g"), api)()
+    assert_eq(result, expected, atol=1e-12)
+    assert np.isnan(computed.loc[("a", "x"), "y"])
+    assert np.isnan(computed.loc[("a", "y"), "x"])
 
 
 @pytest.mark.parametrize(

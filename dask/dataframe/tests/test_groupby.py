@@ -1918,6 +1918,64 @@ def test_groupby_cov(columns):
         assert_eq(expected, result)
 
 
+@pytest.mark.parametrize("api", ["cov", "corr"])
+def test_groupby_cov_corr_with_nulls(api):
+    # groupby cov/corr must honour pandas' pairwise-complete semantics.  When
+    # a group contains nulls, every statistic for a column pair has to be
+    # computed on the rows where *both* columns are observed; mixing pairwise
+    # cross-products with marginal per-column sums/counts otherwise produces
+    # a matrix that disagrees with pandas element by element.
+    rng = np.random.default_rng(42)
+    n_groups, n_cols, rows_per_group = 3, 4, 18
+    cols = [f"c{k}" for k in range(n_cols)]
+    frames = []
+    for gi in range(n_groups):
+        frames.append(
+            pd.DataFrame(
+                {
+                    "key": [gi] * rows_per_group,
+                    **{
+                        c: rng.normal(size=rows_per_group)
+                        + (k if k % 2 else -k)
+                        for k, c in enumerate(cols)
+                    },
+                }
+            )
+        )
+    pdf = pd.concat(frames, ignore_index=True)
+    for c in cols:
+        pdf.loc[rng.random(len(pdf)) < 0.2, c] = np.nan
+
+    ddf = dd.from_pandas(pdf, npartitions=4)
+    expected = getattr(pdf.groupby("key"), api)()
+    result = getattr(ddf.groupby("key"), api)()
+    assert_eq(result, expected, atol=1e-12)
+    # The NaN pattern (insufficient pairwise observations) must also match.
+    computed = result.compute()
+    assert np.array_equal(np.isnan(computed.values), np.isnan(expected.values))
+
+
+@pytest.mark.parametrize("api", ["cov", "corr"])
+def test_groupby_cov_corr_nulls_single_pairwise_observation(api):
+    # Fewer than two pairwise-complete rows for a pair -> NaN for that pair,
+    # matching pandas, without emitting a divide-by-zero RuntimeWarning.
+    pdf = pd.DataFrame(
+        {
+            "key": ["a", "a", "a", "b", "b"],
+            "x": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "y": [np.nan, np.nan, 9.0, 1.0, 2.0],
+        }
+    )
+    ddf = dd.from_pandas(pdf, npartitions=2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        result = getattr(ddf.groupby("key"), api)()
+        computed = result.compute()
+    assert_eq(result, getattr(pdf.groupby("key"), api)(), atol=1e-12)
+    assert np.isnan(computed.loc[("a", "x"), "y"])
+    assert np.isnan(computed.loc[("a", "y"), "x"])
+
+
 def test_df_groupby_idxmin():
     pdf = pd.DataFrame(
         {"idx": list(range(4)), "group": [1, 1, 2, 2], "value": [10, 20, 20, 10]}

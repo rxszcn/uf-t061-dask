@@ -399,28 +399,33 @@ def _cov_finalizer(df, cols, std=False):
     num_cols = len(cols)
     vals = list(range(num_elements))
     col_idx_mapping = dict(zip(cols, range(num_cols)))
+    row = df.iloc[0]
     for i, j in it.combinations_with_replacement(df[cols].columns, 2):
         x = col_idx_mapping[i]
         y = col_idx_mapping[j]
         idx = x + num_cols * y
-        mul_col = f"{i}{j}"
-        ni = df[f"{i}-count"]
-        nj = df[f"{j}-count"]
-
-        n = np.sqrt(ni * nj)
-        div = n - 1
-        div[div < 0] = 0
-        val = (df[mul_col] - df[i] * df[j] / n).values[0] / div.values[0]
-        if std:
-            ii = f"{i}{i}"
-            jj = f"{j}{j}"
-            std_val_i = (df[ii] - (df[i] ** 2) / ni).values[0] / div.values[0]
-            std_val_j = (df[jj] - (df[j] ** 2) / nj).values[0] / div.values[0]
-            sqrt_val = np.sqrt(std_val_i * std_val_j)
-            if sqrt_val == 0:
-                val = np.nan
-            else:
-                val = val / sqrt_val
+        prefix = f"{i},{j}-"
+        # All statistics below share the same pairwise-complete row set,
+        # matching pandas' cov/corr null handling.
+        n_obs = row[prefix + "count"]
+        # pandas requires at least two pairwise-complete observations; a
+        # single observation (or none) has no estimable (co)variance.
+        if n_obs < 2:
+            val = np.nan
+        else:
+            div = n_obs - 1
+            sum_i = row[prefix + "sum_i"]
+            sum_j = row[prefix + "sum_j"]
+            cross_sum = row[f"{i}{j}"]
+            val = (cross_sum - sum_i * sum_j / n_obs) / div
+            if std:
+                var_i = (row[prefix + "ssq_i"] - sum_i**2 / n_obs) / div
+                var_j = (row[prefix + "ssq_j"] - sum_j**2 / n_obs) / div
+                sqrt_val = np.sqrt(var_i * var_j)
+                if sqrt_val == 0:
+                    val = np.nan
+                else:
+                    val = val / sqrt_val
 
         vals[idx] = val
         if i != j:
@@ -433,15 +438,39 @@ def _cov_finalizer(df, cols, std=False):
 
 
 def _mul_cols(df, cols):
-    """Internal function to be used with apply to multiply
-    each column in a dataframe by every other column
+    """Internal function to be used with apply to build the pairwise
+    sufficient statistics of every column pair
 
-    a b c -> a*a, a*b, b*b, b*c, c*c
+    For each unordered pair ``(i, j)`` the following columns are emitted,
+    computed only on the rows where *both* columns are observed (pandas'
+    pairwise-complete semantics):
+
+    - ``ij``: product ``i * j`` (sums across rows to the cross-product sum)
+    - ``i,j-sum_i`` / ``i,j-sum_j``: the two column sums
+    - ``i,j-ssq_i`` / ``i,j-ssq_j``: the two squared-value sums
+    - ``i,j-count``: the number of pairwise-complete rows
+
+    Restricting every statistic to the same pairwise-complete rows is
+    essential: combining a pairwise cross-product/count with the marginal
+    column sums (which use different rows in the presence of nulls) silently
+    diverges from the pandas result whenever any column contains nulls.
     """
     _df = df.__class__()
     for i, j in it.combinations_with_replacement(cols, 2):
-        col = f"{i}{j}"
-        _df[col] = df[i] * df[j]
+        prefix = f"{i},{j}-"
+        # Mask of rows where *both* columns are observed.  Keep every emitted
+        # column aligned to the group's rows (rather than dropping the masked
+        # rows); the non-pairwise positions become NaN/0 and are ignored by
+        # the downstream sum/count aggregation.
+        observed = df[i].notnull() & df[j].notnull()
+        vi = df[i].where(observed)
+        vj = df[j].where(observed)
+        _df[f"{i}{j}"] = vi * vj
+        _df[prefix + "sum_i"] = vi
+        _df[prefix + "sum_j"] = vj
+        _df[prefix + "ssq_i"] = vi**2
+        _df[prefix + "ssq_j"] = vj**2
+        _df[prefix + "count"] = observed.astype(np.int64)
 
     # Fix index in a groupby().apply() context
     # https://github.com/dask/dask/issues/8137
